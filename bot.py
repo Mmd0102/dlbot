@@ -10,6 +10,8 @@ from telegram.ext import (Application, CommandHandler, MessageHandler,
 TOKEN = os.environ["BOT_TOKEN"]
 MAX_SIZE = 49 * 1024 * 1024  # سقف آپلود ربات‌های تلگرام ~50MB
 URL_RE = re.compile(r"https?://\S+")
+# یوزرنیم کانال برای عضویت اجباری، مثل @mychannel (اگر خالی باشد عضویت اجباری خاموش است)
+CHANNEL = os.environ.get("CHANNEL", "").strip()
 
 
 def download(url: str, audio: bool):
@@ -31,6 +33,12 @@ def download(url: str, audio: bool):
         "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         "merge_output_format": "mp4",
     }
+    # کوکی یوتیوب (اختیاری): فایل Secret در Render
+    secret = "/etc/secrets/cookies.txt"
+    if os.path.exists(secret):
+        local = os.path.join(tmp, "cookies.txt")
+        shutil.copy(secret, local)  # کپی چون پوشهٔ secrets فقط‌خواندنی است
+        opts["cookiefile"] = local
     if audio:
         opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{
@@ -52,24 +60,61 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("لینک ویدیو یا آهنگ رو بفرست 🎬🎵")
 
 
+async def is_member(bot, user_id: int) -> bool:
+    """عضویت اجباری: ربات باید در کانال ادمین باشد."""
+    if not CHANNEL:
+        return True
+    try:
+        m = await bot.get_chat_member(CHANNEL, user_id)
+        return m.status in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+
+def join_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 عضویت در کانال", url=f"https://t.me/{CHANNEL.lstrip('@')}")],
+        [InlineKeyboardButton("✅ عضو شدم", callback_data="check")],
+    ])
+
+
+def choice_kb():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎬 ویدیو", callback_data="v"),
+        InlineKeyboardButton("🎵 آهنگ (MP3)", callback_data="a"),
+    ]])
+
+
+JOIN_TEXT = "برای استفاده از ربات اول باید در کانال ما عضو بشی 👇"
+
+
 async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m = URL_RE.search(update.message.text or "")
     if not m:
         return
     ctx.user_data["url"] = m.group(0)
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🎬 ویدیو", callback_data="v"),
-        InlineKeyboardButton("🎵 آهنگ (MP3)", callback_data="a"),
-    ]])
-    await update.message.reply_text("چی می‌خوای؟", reply_markup=kb)
+    if not await is_member(ctx.bot, update.effective_user.id):
+        await update.message.reply_text(JOIN_TEXT, reply_markup=join_kb())
+        return
+    await update.message.reply_text("چی می‌خوای؟", reply_markup=choice_kb())
 
 
 async def on_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if not await is_member(ctx.bot, q.from_user.id):
+        if q.data == "check":
+            await q.answer("هنوز عضو کانال نشدی ❌", show_alert=True)
+        else:
+            await q.answer()
+            await q.edit_message_text(JOIN_TEXT, reply_markup=join_kb())
+        return
     await q.answer()
     url = ctx.user_data.get("url")
     if not url:
         await q.edit_message_text("لینک رو دوباره بفرست.")
+        return
+    if q.data == "check":
+        await q.edit_message_text("✅ عضویتت تأیید شد. چی می‌خوای؟", reply_markup=choice_kb())
         return
     audio = q.data == "a" or "spotify.com" in url
     await q.edit_message_text("⏳ در حال دانلود...")
