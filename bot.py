@@ -1,4 +1,4 @@
-import os, re, asyncio, tempfile, shutil, threading, subprocess
+import os, re, asyncio, tempfile, shutil, threading, subprocess, uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import yt_dlp
@@ -15,7 +15,6 @@ URL_RE = re.compile(r"https?://\S+")
 CHANNEL = os.environ.get("CHANNEL", "").strip()
 # پیام سنجاق‌شده برای کاربران (اگر خالی باشد، سنجاق نمی‌شود)
 NOTICE = os.environ.get("NOTICE", "").strip()
-
 
 def download(url: str, audio: bool):
     tmp = tempfile.mkdtemp()
@@ -134,10 +133,10 @@ def download_song(query: str):
     return tmp, os.path.join(tmp, files[0])
 
 
-def cut_clip(src: str, dst: str):
-    """فقط ۲۰ ثانیهٔ اول را نگه می‌دارد تا تشخیص سریع‌تر و سبک‌تر باشد."""
+def cut_clip(src: str, dst: str, start: int = 0):
+    """فقط ۲۰ ثانیه از فایل را نگه می‌دارد تا تشخیص سریع‌تر و سبک‌تر باشد."""
     subprocess.run(
-        [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", src, "-t", "20",
+        [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-ss", str(start), "-i", src, "-t", "20",
          "-vn", "-ac", "1", "-ar", "44100", dst],
         check=True, capture_output=True, timeout=120,
     )
@@ -201,6 +200,56 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("چی می‌خوای؟", reply_markup=choice_kb())
 
 
+async def on_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """دکمهٔ «دریافت موسیقی» زیر ویدیو."""
+    q = update.callback_query
+    if not await is_member(ctx.bot, q.from_user.id):
+        await q.answer("اول باید در کانال عضو بشی ❌", show_alert=True)
+        return
+    url = ctx.bot_data.get("links", {}).get(q.data[2:])
+    if not url:
+        await q.answer("این دکمه منقضی شده، لینک رو دوباره بفرست.", show_alert=True)
+        return
+    await q.answer("⏳ در حال پیدا کردن آهنگ...")
+    status = await q.message.reply_text("🎧 در حال تشخیص آهنگ این محتوا...")
+    tmp = song_tmp = None
+    try:
+        # ۱) صدای محتوا را می‌گیریم
+        tmp, path = await asyncio.to_thread(download, url, True)
+        # ۲) آهنگ را با Shazam تشخیص می‌دهیم (اول از ابتدا، بعد از ثانیهٔ ۱۵)
+        shazam = Shazam()
+        recognize = getattr(shazam, "recognize", None) or shazam.recognize_song
+        track = None
+        for start in (0, 15):
+            clip = os.path.join(tmp, f"clip{start}.mp3")
+            try:
+                await asyncio.to_thread(cut_clip, path, clip, start)
+                track = (await recognize(clip)).get("track")
+            except Exception:
+                track = None
+            if track:
+                break
+        if not track:
+            await status.edit_text("😕 آهنگ این محتوا تشخیص داده نشد.")
+            return
+        title, artist = track.get("title", "?"), track.get("subtitle", "")
+        text = f"🎵 {title}\n👤 {artist}"
+        await status.edit_text(text + "\n\n⏳ در حال دانلود آهنگ کامل...")
+        # ۳) خود آهنگ کامل را پیدا و ارسال می‌کنیم
+        song_tmp, song = await asyncio.to_thread(download_song, f"{artist} {title}")
+        if os.path.getsize(song) > MAX_SIZE:
+            raise RuntimeError("too big")
+        with open(song, "rb") as sf:
+            await q.message.reply_audio(sf, title=title, performer=artist)
+        await status.edit_text(text)
+    except Exception:
+        await status.edit_text("❌ پیدا کردن آهنگ کامل انجام نشد.")
+    finally:
+        for d in (tmp, song_tmp):
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+
+
 async def on_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not await is_member(ctx.bot, q.from_user.id):
@@ -230,7 +279,14 @@ async def on_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if audio:
                 await q.message.reply_audio(f)
             else:
-                await q.message.reply_video(f, supports_streaming=True)
+                token = uuid.uuid4().hex[:12]
+                links = ctx.bot_data.setdefault("links", {})
+                if len(links) > 500:
+                    links.pop(next(iter(links)))
+                links[token] = url
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🎵دریافت موسیقی🎵", callback_data=f"m:{token}")]])
+                await q.message.reply_video(f, supports_streaming=True, reply_markup=kb)
         await q.delete_message()
     except Exception:
         await q.edit_message_text("❌ دانلود نشد. لینک یا پشتیبانی سایت رو چک کن.")
@@ -262,5 +318,6 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(
         filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE, on_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_link))
-    app.add_handler(CallbackQueryHandler(on_choice))
+    app.add_handler(CallbackQueryHandler(on_music, pattern=r"^m:"))
+    app.add_handler(CallbackQueryHandler(on_choice, pattern=r"^(v|a|check)$"))
     app.run_polling()
