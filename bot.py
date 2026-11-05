@@ -12,6 +12,8 @@ MAX_SIZE = 49 * 1024 * 1024  # سقف آپلود ربات‌های تلگرام 
 URL_RE = re.compile(r"https?://\S+")
 # یوزرنیم کانال برای عضویت اجباری، مثل @mychannel (اگر خالی باشد عضویت اجباری خاموش است)
 CHANNEL = os.environ.get("CHANNEL", "").strip()
+# پیام سنجاق‌شده برای کاربران (اگر خالی باشد، سنجاق نمی‌شود)
+NOTICE = os.environ.get("NOTICE", "").strip()
 
 
 def download(url: str, audio: bool):
@@ -58,6 +60,13 @@ def download(url: str, audio: bool):
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("لینک ویدیو یا آهنگ رو بفرست 🎬🎵")
+    if NOTICE:
+        # پیام اطلاع‌رسانی را می‌فرستد و در چت کاربر سنجاق می‌کند
+        msg = await update.message.reply_text(NOTICE)
+        try:
+            await msg.pin(disable_notification=True)
+        except Exception:
+            pass
 
 
 async def is_member(bot, user_id: int) -> bool:
