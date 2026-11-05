@@ -100,6 +100,40 @@ def choice_kb():
 JOIN_TEXT = "برای استفاده از ربات اول باید در کانال ما عضو بشی 👇"
 
 
+def download_song(query: str):
+    """آهنگ را با اسم پیدا و MP3 می‌کند: اول ساندکلاود، اگر نشد spotdl."""
+    tmp = tempfile.mkdtemp()
+    opts = {
+        "outtmpl": f"{tmp}/%(title).60s.%(ext)s",
+        "noplaylist": True,
+        "quiet": True,
+        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
+        "format": "bestaudio/best",
+        "postprocessors": [{"key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3", "preferredquality": "192"}],
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([f"scsearch1:{query}"])
+    except Exception:
+        pass
+    files = [f for f in os.listdir(tmp) if f.endswith(".mp3")]
+    if not files:
+        try:
+            subprocess.run(
+                ["spotdl", "download", query, "--output", tmp, "--format", "mp3",
+                 "--ffmpeg", imageio_ffmpeg.get_ffmpeg_exe()],
+                check=True, timeout=300,
+            )
+        except Exception:
+            pass
+        files = [f for f in os.listdir(tmp) if f.endswith(".mp3")]
+    if not files:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError("no file")
+    return tmp, os.path.join(tmp, files[0])
+
+
 def cut_clip(src: str, dst: str):
     """فقط ۲۰ ثانیهٔ اول را نگه می‌دارد تا تشخیص سریع‌تر و سبک‌تر باشد."""
     subprocess.run(
@@ -134,11 +168,22 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not track:
             await status.edit_text("😕 آهنگ تشخیص داده نشد. یه تیکهٔ واضح‌تر و طولانی‌تر (۱۰ تا ۲۰ ثانیه) بفرست.")
             return
-        text = f"🎵 {track.get('title', '?')}\n👤 {track.get('subtitle', '?')}"
-        kb = None
-        if track.get("url"):
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 مشاهده در Shazam", url=track["url"])]])
-        await status.edit_text(text, reply_markup=kb)
+        title, artist = track.get("title", "?"), track.get("subtitle", "")
+        text = f"🎵 {title}\n👤 {artist}"
+        await status.edit_text(text + "\n\n⏳ در حال دانلود آهنگ...")
+        song_tmp = None
+        try:
+            song_tmp, song = await asyncio.to_thread(download_song, f"{artist} {title}")
+            if os.path.getsize(song) > MAX_SIZE:
+                raise RuntimeError("too big")
+            with open(song, "rb") as sf:
+                await msg.reply_audio(sf, title=title, performer=artist)
+            await status.edit_text(text)
+        except Exception:
+            await status.edit_text(text + "\n\n❌ خود آهنگ پیدا نشد، فقط اسمش تشخیص داده شد.")
+        finally:
+            if song_tmp:
+                shutil.rmtree(song_tmp, ignore_errors=True)
     except Exception:
         await status.edit_text("❌ تشخیص انجام نشد. دوباره امتحان کن.")
     finally:
