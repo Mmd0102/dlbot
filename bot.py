@@ -1,4 +1,4 @@
-import os, re, asyncio, tempfile, shutil, threading, subprocess, uuid
+import os, re, asyncio, tempfile, shutil, threading, subprocess, uuid, time, math
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import yt_dlp
@@ -15,6 +15,25 @@ URL_RE = re.compile(r"https?://\S+")
 CHANNEL = os.environ.get("CHANNEL", "").strip()
 # پیام سنجاق‌شده برای کاربران (اگر خالی باشد، سنجاق نمی‌شود)
 NOTICE = os.environ.get("NOTICE", "").strip()
+DOWNLOAD_TIMEOUT = 240  # ثانیه؛ بعد از این دانلود قطع می‌شود تا ربات گیر نکند
+
+
+def get_direct_url(url: str):
+    """لینک مستقیم MP4 را بدون دانلود پیدا می‌کند تا خود تلگرام فایل را بگیرد.
+    فقط وقتی جواب می‌دهد که فایل مستقیم باشد و حجمش زیر ۱۹ مگابایت باشد."""
+    opts = {
+        "quiet": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+        "format": "b[protocol=https][ext=mp4][height<=720]/b[protocol=http][ext=mp4][height<=720]",
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    size = info.get("filesize") or info.get("filesize_approx")
+    if not size or size > 19 * 1024 * 1024 or not info.get("url"):
+        return None
+    return info["url"]
+
 
 def download(url: str, audio: bool):
     tmp = tempfile.mkdtemp()
@@ -34,10 +53,27 @@ def download(url: str, audio: bool):
         "quiet": True,
         "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         "merge_output_format": "mp4",
+        "socket_timeout": 30,
+        "retries": 3,
+        "max_filesize": 300 * 1024 * 1024,  # فایل‌های خیلی بزرگ‌تر رد می‌شوند
+        "concurrent_fragment_downloads": 4,
     }
+    deadline = time.time() + DOWNLOAD_TIMEOUT
+
+    def hook(d):
+        if time.time() > deadline:
+            raise yt_dlp.utils.DownloadCancelled("timeout")
+
+    opts["progress_hooks"] = [hook]
     # کوکی یوتیوب (اختیاری): فایل Secret در Render
     secret = "/etc/secrets/cookies.txt"
-    if os.path.exists(secret):
+    env_cookies = os.environ.get("YT_COOKIES", "")
+    if env_cookies:  # متن کوکی‌ها در متغیر محیطی YT_COOKIES
+        local = os.path.join(tmp, "cookies.txt")
+        with open(local, "w") as cf:
+            cf.write(env_cookies)
+        opts["cookiefile"] = local
+    elif os.path.exists(secret):  # یا فایل Secret با نام cookies.txt
         local = os.path.join(tmp, "cookies.txt")
         shutil.copy(secret, local)  # کپی چون پوشهٔ secrets فقط‌خواندنی است
         opts["cookiefile"] = local
@@ -49,7 +85,9 @@ def download(url: str, audio: bool):
             "preferredquality": "192",
         }]
     else:
-        opts["format"] = "b[height<=720][ext=mp4]/bv*[height<=720]+ba/b"
+        # کیفیت حداکثر ۴۸۰ تا سریع‌تر دانلود شود و زیر ۵۰ مگابایت بماند
+        opts["format"] = ("b[height<=480][filesize<45M]/b[height<=360]/"
+                          "bv*[height<=360]+ba/b[height<=480]/b")
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
     files = os.listdir(tmp)
@@ -250,6 +288,43 @@ async def on_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 shutil.rmtree(d, ignore_errors=True)
 
 
+def split_video(path: str):
+    """ویدیوی بزرگ‌تر از ۵۰ مگابایت را بدون افت کیفیت به چند بخش تقسیم می‌کند."""
+    size = os.path.getsize(path)
+    if size <= MAX_SIZE:
+        return [path]
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    r = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True)
+    m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr)
+    if not m:
+        raise RuntimeError("no duration")
+    duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    parts = math.ceil(size / (30 * 1024 * 1024))  # حاشیهٔ اطمینان چون برش روی کلیدفریم‌هاست
+    seg = max(int(duration / parts), 5)
+    out_dir = os.path.dirname(path)
+    subprocess.run(
+        [ffmpeg, "-y", "-i", path, "-map", "0", "-c", "copy", "-f", "segment",
+         "-segment_time", str(seg), "-reset_timestamps", "1",
+         os.path.join(out_dir, "part%03d.mp4")],
+        check=True, capture_output=True, timeout=300,
+    )
+    files = sorted(os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.startswith("part"))
+    if not files or any(os.path.getsize(f) > MAX_SIZE for f in files):
+        raise RuntimeError("part too big")
+    return files
+
+
+def music_kb(ctx, url: str):
+    """دکمهٔ «دریافت موسیقی» زیر ویدیو."""
+    token = uuid.uuid4().hex[:12]
+    links = ctx.bot_data.setdefault("links", {})
+    if len(links) > 500:
+        links.pop(next(iter(links)))
+    links[token] = url
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎵دریافت موسیقی🎵", callback_data=f"m:{token}")]])
+
+
 async def on_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not await is_member(ctx.bot, q.from_user.id):
@@ -269,27 +344,38 @@ async def on_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     audio = q.data == "a" or "spotify.com" in url
     await q.edit_message_text("⏳ در حال دانلود...")
+    # راه سریع: لینک مستقیم را به تلگرام می‌دهیم تا خودش فایل را بگیرد
+    if not audio:
+        try:
+            direct = await asyncio.to_thread(get_direct_url, url)
+            if direct:
+                await q.message.reply_video(direct, supports_streaming=True,
+                                            reply_markup=music_kb(ctx, url))
+                await q.delete_message()
+                return
+        except Exception:
+            pass  # نشد؟ می‌رویم سراغ دانلود معمولی
     tmp = None
     try:
         tmp, path = await asyncio.to_thread(download, url, audio)
-        if os.path.getsize(path) > MAX_SIZE:
-            await q.edit_message_text("❌ حجم فایل بیشتر از ۵۰ مگابایته و تلگرام اجازه ارسال نمیده.")
-            return
-        with open(path, "rb") as f:
-            if audio:
+        if audio:
+            if os.path.getsize(path) > MAX_SIZE:
+                await q.edit_message_text("❌ حجم فایل بیشتر از ۵۰ مگابایته و تلگرام اجازه ارسال نمیده.")
+                return
+            with open(path, "rb") as f:
                 await q.message.reply_audio(f)
-            else:
-                token = uuid.uuid4().hex[:12]
-                links = ctx.bot_data.setdefault("links", {})
-                if len(links) > 500:
-                    links.pop(next(iter(links)))
-                links[token] = url
-                kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🎵دریافت موسیقی🎵", callback_data=f"m:{token}")]])
-                await q.message.reply_video(f, supports_streaming=True, reply_markup=kb)
+        else:
+            # ویدیوی بزرگ به چند بخش تقسیم می‌شود
+            parts = await asyncio.to_thread(split_video, path)
+            for i, p in enumerate(parts, 1):
+                with open(p, "rb") as f:
+                    await q.message.reply_video(
+                        f, supports_streaming=True,
+                        caption=f"بخش {i} از {len(parts)}" if len(parts) > 1 else None,
+                        reply_markup=music_kb(ctx, url) if i == len(parts) else None)
         await q.delete_message()
     except Exception:
-        await q.edit_message_text("❌ دانلود نشد. لینک یا پشتیبانی سایت رو چک کن.")
+        await q.edit_message_text("❌ دانلود نشد (زمان تمام شد یا حجم زیاد بود). یه لینک دیگه امتحان کن.")
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)

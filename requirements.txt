@@ -1,5 +1,6 @@
 python-telegram-bot==21.6
-yt-dlp
+yt-dlp[default]
+deno
 imageio-ffmpeg
 spotdl
 shazamio
