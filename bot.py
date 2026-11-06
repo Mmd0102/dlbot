@@ -478,7 +478,8 @@ async def on_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for h, s in quals[-6:]:
                 label = f"{h}p — {fmt_mb(s)}"
                 if s > MAX_SIZE:
-                    label += f" ({math.ceil(s / (30 * 1024 * 1024))} بخش)"
+                    # ترتیب برعکس نوشته شده چون تلگرام در این خط ترکیبی، عدد را جابه‌جا نشان می‌دهد
+                    label += f" (بخش {math.ceil(s / (30 * 1024 * 1024))})"
                 rows.append([InlineKeyboardButton(label, callback_data=f"q:{token}:{h}")])
             await q.edit_message_text(
                 "📦 حجم این ویدیو از ۵۰ مگابایت بیشتره.\n"
