@@ -15,7 +15,8 @@ URL_RE = re.compile(r"https?://\S+")
 CHANNEL = os.environ.get("CHANNEL", "").strip()
 # پیام سنجاق‌شده برای کاربران (اگر خالی باشد، سنجاق نمی‌شود)
 NOTICE = os.environ.get("NOTICE", "").strip()
-DOWNLOAD_TIMEOUT = 240  # ثانیه؛ بعد از این دانلود قطع می‌شود تا ربات گیر نکند
+DOWNLOAD_TIMEOUT = 600  # ثانیه؛ بعد از این دانلود قطع می‌شود تا ربات گیر نکند
+MAX_DOWNLOAD = 300 * 1024 * 1024  # بزرگ‌ترین حجمی که روی هاست رایگان دانلود می‌کنیم
 
 
 def get_direct_url(url: str):
@@ -35,7 +36,60 @@ def get_direct_url(url: str):
     return info["url"]
 
 
-def download(url: str, audio: bool):
+def add_cookies(opts: dict, tmp: str):
+    """کوکی یوتیوب (اختیاری): از متغیر YT_COOKIES یا فایل Secret."""
+    secret = "/etc/secrets/cookies.txt"
+    env_cookies = os.environ.get("YT_COOKIES", "")
+    if env_cookies:
+        local = os.path.join(tmp, "cookies.txt")
+        with open(local, "w") as cf:
+            cf.write(env_cookies)
+        opts["cookiefile"] = local
+    elif os.path.exists(secret):
+        local = os.path.join(tmp, "cookies.txt")
+        shutil.copy(secret, local)  # کپی چون پوشهٔ secrets فقط‌خواندنی است
+        opts["cookiefile"] = local
+
+
+def list_qualities(url: str):
+    """کیفیت‌های موجود و حجم تقریبی هر کدام را برمی‌گرداند: [(ارتفاع, حجم_بایت), ...]"""
+    tmp = tempfile.mkdtemp()
+    try:
+        opts = {"quiet": True, "noplaylist": True, "socket_timeout": 20}
+        add_cookies(opts, tmp)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    duration = info.get("duration") or 0
+    formats = info.get("formats") or []
+
+    def fsize(f):
+        s = f.get("filesize") or f.get("filesize_approx")
+        if not s and f.get("tbr") and duration:
+            s = int(f["tbr"] * 1000 / 8 * duration)
+        return s
+
+    # بزرگ‌ترین فایل صوتی تنها (برای اضافه کردن به ویدیوهای بدون صدا)
+    audio_size = 0
+    for f in formats:
+        if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none"):
+            audio_size = max(audio_size, fsize(f) or 0)
+    best = {}
+    for f in formats:
+        h = f.get("height")
+        if not h or f.get("vcodec") == "none":
+            continue
+        s = fsize(f)
+        if not s:
+            continue
+        if f.get("acodec") == "none":  # ویدیوی بدون صدا: حجم صدا هم اضافه شود
+            s += audio_size
+        best[h] = max(best.get(h, 0), s)
+    return sorted(best.items())
+
+
+def download(url: str, audio: bool, height: int = None):
     tmp = tempfile.mkdtemp()
     if "spotify.com" in url:
         subprocess.run(
@@ -55,7 +109,7 @@ def download(url: str, audio: bool):
         "merge_output_format": "mp4",
         "socket_timeout": 30,
         "retries": 3,
-        "max_filesize": 300 * 1024 * 1024,  # فایل‌های خیلی بزرگ‌تر رد می‌شوند
+        "max_filesize": MAX_DOWNLOAD,  # فایل‌های خیلی بزرگ‌تر رد می‌شوند
         "concurrent_fragment_downloads": 4,
     }
     deadline = time.time() + DOWNLOAD_TIMEOUT
@@ -65,18 +119,7 @@ def download(url: str, audio: bool):
             raise yt_dlp.utils.DownloadCancelled("timeout")
 
     opts["progress_hooks"] = [hook]
-    # کوکی یوتیوب (اختیاری): فایل Secret در Render
-    secret = "/etc/secrets/cookies.txt"
-    env_cookies = os.environ.get("YT_COOKIES", "")
-    if env_cookies:  # متن کوکی‌ها در متغیر محیطی YT_COOKIES
-        local = os.path.join(tmp, "cookies.txt")
-        with open(local, "w") as cf:
-            cf.write(env_cookies)
-        opts["cookiefile"] = local
-    elif os.path.exists(secret):  # یا فایل Secret با نام cookies.txt
-        local = os.path.join(tmp, "cookies.txt")
-        shutil.copy(secret, local)  # کپی چون پوشهٔ secrets فقط‌خواندنی است
-        opts["cookiefile"] = local
+    add_cookies(opts, tmp)
     if audio:
         opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{
@@ -84,8 +127,11 @@ def download(url: str, audio: bool):
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
+    elif height:
+        # کیفیتی که کاربر انتخاب کرده
+        opts["format"] = f"bv*[height<={height}]+ba/b[height<={height}]/b"
     else:
-        # کیفیت حداکثر ۴۸۰ تا سریع‌تر دانلود شود و زیر ۵۰ مگابایت بماند
+        # پیش‌فرض: کیفیت حداکثر ۴۸۰ تا سریع‌تر دانلود شود و زیر ۵۰ مگابایت بماند
         opts["format"] = ("b[height<=480][filesize<45M]/b[height<=360]/"
                           "bv*[height<=360]+ba/b[height<=480]/b")
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -107,6 +153,16 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.pin(disable_notification=True)
         except Exception:
             pass
+    else:
+        await unpin_old(ctx, update.effective_chat.id)
+
+
+async def unpin_old(ctx, chat_id: int):
+    """پیام‌های سنجاق‌شدهٔ قبلی (مثل پیام مشکل یوتیوب) را از چت کاربر برمی‌دارد."""
+    try:
+        await ctx.bot.unpin_all_chat_messages(chat_id)
+    except Exception:
+        pass
 
 
 async def is_member(bot, user_id: int) -> bool:
@@ -232,6 +288,9 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not m:
         return
     ctx.user_data["url"] = m.group(0)
+    if not NOTICE and not ctx.user_data.get("unpinned"):
+        ctx.user_data["unpinned"] = True
+        await unpin_old(ctx, update.effective_chat.id)
     if not await is_member(ctx.bot, update.effective_user.id):
         await update.message.reply_text(JOIN_TEXT, reply_markup=join_kb())
         return
@@ -314,15 +373,77 @@ def split_video(path: str):
     return files
 
 
-def music_kb(ctx, url: str):
-    """دکمهٔ «دریافت موسیقی» زیر ویدیو."""
+def save_link(ctx, url: str) -> str:
+    """لینک را در حافظه نگه می‌دارد و یک شناسهٔ کوتاه برای دکمه‌ها برمی‌گرداند."""
     token = uuid.uuid4().hex[:12]
     links = ctx.bot_data.setdefault("links", {})
     if len(links) > 500:
         links.pop(next(iter(links)))
     links[token] = url
+    return token
+
+
+def music_kb(ctx, url: str):
+    """دکمهٔ «دریافت موسیقی» زیر ویدیو."""
+    token = save_link(ctx, url)
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🎵دریافت موسیقی🎵", callback_data=f"m:{token}")]])
+
+
+def fmt_mb(size: int) -> str:
+    return f"{size / (1024 * 1024):.0f} MB"
+
+
+async def deliver_video(q, ctx, url: str, height: int = None):
+    """ویدیو را دانلود می‌کند و می‌فرستد (در صورت نیاز در چند بخش)."""
+    # راه سریع: لینک مستقیم را به تلگرام می‌دهیم تا خودش فایل را بگیرد
+    if height is None:
+        try:
+            direct = await asyncio.to_thread(get_direct_url, url)
+            if direct:
+                await q.message.reply_video(direct, supports_streaming=True,
+                                            reply_markup=music_kb(ctx, url))
+                await q.delete_message()
+                return
+        except Exception:
+            pass  # نشد؟ می‌رویم سراغ دانلود معمولی
+    tmp = None
+    try:
+        tmp, path = await asyncio.to_thread(download, url, False, height)
+        parts = await asyncio.to_thread(split_video, path)
+        for i, p in enumerate(parts, 1):
+            with open(p, "rb") as f:
+                await q.message.reply_video(
+                    f, supports_streaming=True,
+                    caption=f"بخش {i} از {len(parts)}" if len(parts) > 1 else None,
+                    reply_markup=music_kb(ctx, url) if i == len(parts) else None)
+        await q.delete_message()
+    except Exception:
+        await q.edit_message_text("❌ دانلود نشد (زمان تمام شد یا حجم زیاد بود). یه کیفیت پایین‌تر یا لینک دیگه امتحان کن.")
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """کاربر یکی از کیفیت‌های پیشنهادی را انتخاب کرد."""
+    q = update.callback_query
+    if not await is_member(ctx.bot, q.from_user.id):
+        await q.answer("اول باید در کانال عضو بشی ❌", show_alert=True)
+        return
+    try:
+        _, token, h = q.data.split(":")
+        height = int(h)
+    except ValueError:
+        await q.answer()
+        return
+    url = ctx.bot_data.get("links", {}).get(token)
+    if not url:
+        await q.answer("این گزینه منقضی شده، لینک رو دوباره بفرست.", show_alert=True)
+        return
+    await q.answer()
+    await q.edit_message_text(f"⏳ در حال دانلود با کیفیت {height}p ...")
+    await deliver_video(q, ctx, url, height)
 
 
 async def on_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -343,39 +464,42 @@ async def on_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("✅ عضویتت تأیید شد. چی می‌خوای؟", reply_markup=choice_kb())
         return
     audio = q.data == "a" or "spotify.com" in url
-    await q.edit_message_text("⏳ در حال دانلود...")
-    # راه سریع: لینک مستقیم را به تلگرام می‌دهیم تا خودش فایل را بگیرد
     if not audio:
+        await q.edit_message_text("🔎 در حال بررسی کیفیت‌ها...")
         try:
-            direct = await asyncio.to_thread(get_direct_url, url)
-            if direct:
-                await q.message.reply_video(direct, supports_streaming=True,
-                                            reply_markup=music_kb(ctx, url))
-                await q.delete_message()
-                return
+            quals = await asyncio.to_thread(list_qualities, url)
         except Exception:
-            pass  # نشد؟ می‌رویم سراغ دانلود معمولی
+            quals = []
+        quals = [(h, s) for h, s in quals if s <= MAX_DOWNLOAD]
+        # اگر حجم ویدیو از ۵۰ مگابایت بیشتر است، کیفیت‌ها را به کاربر نشان می‌دهیم
+        if quals and max(s for _, s in quals) > MAX_SIZE:
+            token = save_link(ctx, url)
+            rows = []
+            for h, s in quals[-6:]:
+                label = f"{h}p — {fmt_mb(s)}"
+                if s > MAX_SIZE:
+                    label += f" ({math.ceil(s / (30 * 1024 * 1024))} بخش)"
+                rows.append([InlineKeyboardButton(label, callback_data=f"q:{token}:{h}")])
+            await q.edit_message_text(
+                "📦 حجم این ویدیو از ۵۰ مگابایت بیشتره.\n"
+                "کیفیت مورد نظرت رو انتخاب کن (حجم‌ها تقریبیه):",
+                reply_markup=InlineKeyboardMarkup(rows))
+            return
+        await q.edit_message_text("⏳ در حال دانلود...")
+        await deliver_video(q, ctx, url)
+        return
+    await q.edit_message_text("⏳ در حال دانلود...")
     tmp = None
     try:
-        tmp, path = await asyncio.to_thread(download, url, audio)
-        if audio:
-            if os.path.getsize(path) > MAX_SIZE:
-                await q.edit_message_text("❌ حجم فایل بیشتر از ۵۰ مگابایته و تلگرام اجازه ارسال نمیده.")
-                return
-            with open(path, "rb") as f:
-                await q.message.reply_audio(f)
-        else:
-            # ویدیوی بزرگ به چند بخش تقسیم می‌شود
-            parts = await asyncio.to_thread(split_video, path)
-            for i, p in enumerate(parts, 1):
-                with open(p, "rb") as f:
-                    await q.message.reply_video(
-                        f, supports_streaming=True,
-                        caption=f"بخش {i} از {len(parts)}" if len(parts) > 1 else None,
-                        reply_markup=music_kb(ctx, url) if i == len(parts) else None)
+        tmp, path = await asyncio.to_thread(download, url, True)
+        if os.path.getsize(path) > MAX_SIZE:
+            await q.edit_message_text("❌ حجم فایل بیشتر از ۵۰ مگابایته و تلگرام اجازه ارسال نمیده.")
+            return
+        with open(path, "rb") as f:
+            await q.message.reply_audio(f)
         await q.delete_message()
     except Exception:
-        await q.edit_message_text("❌ دانلود نشد (زمان تمام شد یا حجم زیاد بود). یه لینک دیگه امتحان کن.")
+        await q.edit_message_text("❌ دانلود نشد. لینک یا پشتیبانی سایت رو چک کن.")
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -410,5 +534,6 @@ if __name__ == "__main__":
         filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE, on_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_link))
     app.add_handler(CallbackQueryHandler(on_music, pattern=r"^m:"))
+    app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q:"))
     app.add_handler(CallbackQueryHandler(on_choice, pattern=r"^(v|a|check)$"))
     app.run_polling()
