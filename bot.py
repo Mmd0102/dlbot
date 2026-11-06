@@ -17,6 +17,8 @@ CHANNEL = os.environ.get("CHANNEL", "").strip()
 NOTICE = os.environ.get("NOTICE", "").strip()
 DOWNLOAD_TIMEOUT = 600  # ثانیه؛ بعد از این دانلود قطع می‌شود تا ربات گیر نکند
 MAX_DOWNLOAD = 300 * 1024 * 1024  # بزرگ‌ترین حجمی که روی هاست رایگان دانلود می‌کنیم
+# حداقل فاصلهٔ دو لینک پشت‌سرهم از یک کاربر (ثانیه). با متغیر LINK_COOLDOWN قابل تغییر است
+LINK_COOLDOWN = int(os.environ.get("LINK_COOLDOWN", "30"))
 
 
 def get_direct_url(url: str):
@@ -299,6 +301,12 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m = URL_RE.search(update.message.text or "")
     if not m:
         return
+    # فاصلهٔ زمانی بین دو لینک هر کاربر تا فشار زیادی به ربات نیاید
+    wait = LINK_COOLDOWN - (time.time() - ctx.user_data.get("last_link", 0))
+    if wait > 0:
+        await update.message.reply_text(
+            f"⏳ لطفاً {math.ceil(wait)} ثانیه دیگه صبر کن و بعد لینک بعدی رو بفرست.")
+        return
     ctx.user_data["url"] = m.group(0)
     if not NOTICE and not ctx.user_data.get("unpinned"):
         ctx.user_data["unpinned"] = True
@@ -306,6 +314,7 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await is_member(ctx.bot, update.effective_user.id):
         await update.message.reply_text(JOIN_TEXT, reply_markup=join_kb())
         return
+    ctx.user_data["last_link"] = time.time()
     await update.message.reply_text("چی می‌خوای؟", reply_markup=choice_kb())
 
 
