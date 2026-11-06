@@ -1,4 +1,4 @@
-import os, re, asyncio, tempfile, shutil, threading, subprocess, uuid, time, math
+import os, re, asyncio, tempfile, shutil, threading, subprocess, uuid, time, math, traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import yt_dlp
@@ -36,31 +36,36 @@ def get_direct_url(url: str):
     return info["url"]
 
 
-def add_cookies(opts: dict, tmp: str):
-    """کوکی یوتیوب (اختیاری): از متغیر YT_COOKIES یا فایل Secret."""
+def add_cookies(opts: dict):
+    """کوکی یوتیوب (اختیاری): از متغیر YT_COOKIES یا فایل Secret.
+    فایل کوکی در یک پوشهٔ جدا ساخته می‌شود (نه کنار فایل‌های دانلودی)،
+    و مسیر آن پوشه برگردانده می‌شود تا بعد از کار پاک شود."""
     secret = "/etc/secrets/cookies.txt"
     env_cookies = os.environ.get("YT_COOKIES", "")
+    if not env_cookies and not os.path.exists(secret):
+        return None
+    ck = tempfile.mkdtemp()
+    local = os.path.join(ck, "cookies.txt")
     if env_cookies:
-        local = os.path.join(tmp, "cookies.txt")
         with open(local, "w") as cf:
             cf.write(env_cookies)
-        opts["cookiefile"] = local
-    elif os.path.exists(secret):
-        local = os.path.join(tmp, "cookies.txt")
+    else:
         shutil.copy(secret, local)  # کپی چون پوشهٔ secrets فقط‌خواندنی است
-        opts["cookiefile"] = local
+    opts["cookiefile"] = local
+    return ck
 
 
 def list_qualities(url: str):
     """کیفیت‌های موجود و حجم تقریبی هر کدام را برمی‌گرداند: [(ارتفاع, حجم_بایت), ...]"""
-    tmp = tempfile.mkdtemp()
+    ck = None
     try:
         opts = {"quiet": True, "noplaylist": True, "socket_timeout": 20}
-        add_cookies(opts, tmp)
+        ck = add_cookies(opts)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        if ck:
+            shutil.rmtree(ck, ignore_errors=True)
     duration = info.get("duration") or 0
     formats = info.get("formats") or []
 
@@ -119,7 +124,7 @@ def download(url: str, audio: bool, height: int = None):
             raise yt_dlp.utils.DownloadCancelled("timeout")
 
     opts["progress_hooks"] = [hook]
-    add_cookies(opts, tmp)
+    ck = add_cookies(opts)
     if audio:
         opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{
@@ -134,12 +139,19 @@ def download(url: str, audio: bool, height: int = None):
         # پیش‌فرض: کیفیت حداکثر ۴۸۰ تا سریع‌تر دانلود شود و زیر ۵۰ مگابایت بماند
         opts["format"] = ("b[height<=480][filesize<45M]/b[height<=360]/"
                           "bv*[height<=360]+ba/b[height<=480]/b")
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-    files = os.listdir(tmp)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    finally:
+        if ck:
+            shutil.rmtree(ck, ignore_errors=True)
+    # فقط فایل‌های رسانه‌ای؛ بزرگ‌ترین فایل همان ویدیو یا آهنگ است
+    files = [os.path.join(tmp, f) for f in os.listdir(tmp)
+             if os.path.isfile(os.path.join(tmp, f))
+             and not f.endswith((".part", ".ytdl", ".txt", ".json", ".temp"))]
     if not files:
         raise RuntimeError("no file")
-    return tmp, os.path.join(tmp, files[0])
+    return tmp, max(files, key=os.path.getsize)
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -419,6 +431,7 @@ async def deliver_video(q, ctx, url: str, height: int = None):
                     reply_markup=music_kb(ctx, url) if i == len(parts) else None)
         await q.delete_message()
     except Exception:
+        traceback.print_exc()  # خطا در Logs رندر ثبت می‌شود
         await q.edit_message_text("❌ دانلود نشد (زمان تمام شد یا حجم زیاد بود). یه کیفیت پایین‌تر یا لینک دیگه امتحان کن.")
     finally:
         if tmp:
