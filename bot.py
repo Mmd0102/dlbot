@@ -97,7 +97,10 @@ def probe(url: str):
             h = f.get("height") or 0
             if s and s <= 19 * 1024 * 1024 and h <= 720 and h > direct_h:
                 direct, direct_h = f["url"], h
-    return {"quals": sorted(best.items()), "direct": direct}
+    heights = sorted({f["height"] for f in formats
+                      if f.get("height") and f.get("vcodec") != "none"})
+    return {"quals": sorted(best.items()), "direct": direct,
+            "heights": heights, "duration": duration}
 
 
 def download(url: str, audio: bool, height: int = None):
@@ -254,6 +257,22 @@ def cut_clip(src: str, dst: str, start: int = 0):
     )
 
 
+def track_text(track: dict) -> str:
+    """اسم آهنگ، خواننده و (در صورت وجود) آلبوم و سال انتشار."""
+    lines = [f"🎵 {track.get('title', '?')}"]
+    if track.get("subtitle"):
+        lines.append(f"👤 {track['subtitle']}")
+    meta = {}
+    for sec in track.get("sections") or []:
+        for m in sec.get("metadata") or []:
+            meta[m.get("title")] = m.get("text")
+    if meta.get("Album"):
+        lines.append(f"💿 {meta['Album']}")
+    if meta.get("Released"):
+        lines.append(f"📅 {meta['Released']}")
+    return "\n".join(lines)
+
+
 async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """تشخیص آهنگ از ویس، فایل صوتی، ویدیو یا ویدیو‌مسیج."""
     msg = update.message
@@ -280,7 +299,7 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("😕 آهنگ تشخیص داده نشد. یه تیکهٔ واضح‌تر و طولانی‌تر (۱۰ تا ۲۰ ثانیه) بفرست.")
             return
         title, artist = track.get("title", "?"), track.get("subtitle", "")
-        text = f"🎵 {title}\n👤 {artist}"
+        text = track_text(track)
         await status.edit_text(text + "\n\n⏳ در حال دانلود آهنگ...")
         song_tmp = None
         try:
@@ -337,6 +356,7 @@ async def on_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer("⏳ در حال پیدا کردن آهنگ...")
     status = await q.message.reply_text("🎧 در حال تشخیص آهنگ این محتوا...")
     tmp = song_tmp = None
+    text = None
     try:
         # ۱) صدای محتوا را می‌گیریم
         tmp, path = await asyncio.to_thread(download, url, True)
@@ -357,7 +377,7 @@ async def on_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("😕 آهنگ این محتوا تشخیص داده نشد.")
             return
         title, artist = track.get("title", "?"), track.get("subtitle", "")
-        text = f"🎵 {title}\n👤 {artist}"
+        text = track_text(track)
         await status.edit_text(text + "\n\n⏳ در حال دانلود آهنگ کامل...")
         # ۳) خود آهنگ کامل را پیدا و ارسال می‌کنیم
         song_tmp, song = await asyncio.to_thread(download_song, f"{artist} {title}")
@@ -367,7 +387,11 @@ async def on_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_audio(sf, title=title, performer=artist)
         await status.edit_text(text)
     except Exception:
-        await status.edit_text("❌ پیدا کردن آهنگ کامل انجام نشد.")
+        traceback.print_exc()
+        if text:  # آهنگ تشخیص داده شده ولی فایلش پیدا یا ارسال نشد
+            await status.edit_text(text + "\n\n❌ خود آهنگ پیدا نشد، فقط مشخصاتش تشخیص داده شد.")
+        else:
+            await status.edit_text("❌ پیدا کردن آهنگ انجام نشد.")
     finally:
         for d in (tmp, song_tmp):
             if d:
@@ -616,7 +640,8 @@ async def process(q, ctx, url: str, audio: bool):
     try:
         info = await asyncio.to_thread(probe, url)
     except Exception:
-        info = {"quals": [], "direct": None}
+        traceback.print_exc()  # دلیل خطا در Logs رندر ثبت می‌شود
+        info = {"quals": [], "direct": None, "heights": [], "duration": 0}
     # راه سریع: لینک مستقیم کوچک را به تلگرام می‌دهیم تا خودش فایل را بگیرد
     if info["direct"]:
         try:
@@ -630,20 +655,28 @@ async def process(q, ctx, url: str, audio: bool):
         except Exception:
             pass  # نشد؟ می‌رویم سراغ دانلود معمولی
     quals = [(h, s) for h, s in info["quals"] if s <= MAX_DOWNLOAD]
-    # اگر حجم ویدیو از ۵۰ مگابایت بیشتر است، کیفیت‌ها را به کاربر نشان می‌دهیم
+    options = None
     if quals and max(s for _, s in quals) > MAX_SIZE:
+        # حجم ویدیو از ۵۰ مگابایت بیشتر است
+        options = quals[-6:]
+        note = "📦 حجم این ویدیو از ۵۰ مگابایت بیشتره.\nکیفیت مورد نظرت رو انتخاب کن (حجم‌ها تقریبیه):"
+    elif not quals and info.get("heights") and (info.get("duration") or 0) > 600:
+        # حجم‌ها معلوم نیست ولی ویدیو بلند است: کیفیت‌ها را بدون حجم نشان می‌دهیم
+        options = [(h, None) for h in info["heights"][-6:]]
+        note = "📦 این ویدیو طولانیه و ممکنه حجمش از ۵۰ مگابایت بیشتر باشه.\nکیفیت مورد نظرت رو انتخاب کن:"
+    if options:
         token = save_link(ctx, url)
         rows = []
-        for h, s in quals[-6:]:
-            label = f"{h}p — {fmt_mb(s)}"
-            if s > MAX_SIZE:
-                # ترتیب برعکس نوشته شده چون تلگرام در این خط ترکیبی، عدد را جابه‌جا نشان می‌دهد
-                label += f" (بخش {math.ceil(s / (30 * 1024 * 1024))})"
+        for h, sz in options:
+            if sz is None:
+                label = f"{h}p — حجم نامشخص"
+            else:
+                label = f"{h}p — {fmt_mb(sz)}"
+                if sz > MAX_SIZE:
+                    # ترتیب برعکس نوشته شده چون تلگرام در این خط ترکیبی، عدد را جابه‌جا نشان می‌دهد
+                    label += f" (بخش {math.ceil(sz / (30 * 1024 * 1024))})"
             rows.append([InlineKeyboardButton(label, callback_data=f"q:{token}:{h}")])
-        await q.edit_message_text(
-            "📦 حجم این ویدیو از ۵۰ مگابایت بیشتره.\n"
-            "کیفیت مورد نظرت رو انتخاب کن (حجم‌ها تقریبیه):",
-            reply_markup=InlineKeyboardMarkup(rows))
+        await q.edit_message_text(note, reply_markup=InlineKeyboardMarkup(rows))
         return
     await q.edit_message_text("⏳ در حال دانلود...")
     await deliver_video(q, ctx, url)
